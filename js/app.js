@@ -154,6 +154,8 @@
   });
 
   function showLoginForm(){
+    document.querySelectorAll('.manage-view.show, .modal-overlay.show, .fm-editor-overlay.show').forEach(el => el.classList.remove('show'));
+    try{ hideAllScreens(); }catch(e){}
     loginView.style.display = '';
     loggedInView.classList.remove('show');
     adminView.style.display = 'none';
@@ -502,6 +504,17 @@
   let stateHold = 0;
   let burstTimer = null;
 
+  function fmtUptime(ms){
+    let t = Math.floor((+ms || 0) / 1000);
+    if(t <= 0) return '0s';
+    const d = Math.floor(t / 86400), h = Math.floor(t % 86400 / 3600), m = Math.floor(t % 3600 / 60), sec = t % 60;
+    if(d) return `${d}d ${h}h ${m}m`;
+    if(h) return `${h}h ${m}m`;
+    if(m) return `${m}m ${sec}s`;
+    return `${sec}s`;
+  }
+  window.fmtUptime = fmtUptime;
+
   function setState(state, hold){
     const el = document.getElementById('serverState');
     if(!el || !state) return;
@@ -689,7 +702,7 @@
       const d = data.dedicated;
       setState(d ? d.state : r.current_state);
       document.getElementById('infoAddress').textContent = data.address || '—';
-      document.getElementById('infoUptime').textContent = r.uptime ? Math.floor(r.uptime/60000) + 'm' : '—';
+      document.getElementById('infoUptime').textContent = r.uptime ? fmtUptime(r.uptime) : '—';
       document.getElementById('infoCpu').textContent = (r.cpu_absolute ?? '—') + '%';
       const pl = data.panel_limits || {};
       const down = !!data.panel_unreachable && !data.dedicated;
@@ -705,7 +718,7 @@
         document.getElementById('infoMemory').textContent = usage(d.mem_used_mb || 0, d.mem_limit_mb || pl.mem_mb);
         document.getElementById('infoDisk').textContent = usage(d.disk_used_mb || 0, d.disk_limit_mb || pl.disk_mb);
         document.getElementById('infoAddress').textContent = d.state === 'running' ? 'Running' : 'Offline';
-        document.getElementById('infoUptime').textContent = d.state === 'running' ? Math.floor((d.uptime_ms||0)/60000) + 'm' : '—';
+        document.getElementById('infoUptime').textContent = d.state === 'running' ? fmtUptime(d.uptime_ms) : '—';
       }
 
       pushGraphPoint('cpu', r.cpu_absolute || 0, (data.limits && data.limits.cpuLimit) || pl.cpu || null);
@@ -954,20 +967,44 @@
   }
 
 
+  const termHist = []; let termIdx = 0;
+  const termPrint = (t) => {
+    const out = document.getElementById('terminalOutput');
+    out.appendChild(document.createTextNode(t + '\n'));
+    out.scrollTop = out.scrollHeight;
+  };
   document.getElementById('terminalInput').addEventListener('keydown', async (e) => {
+    const el = e.target;
+    if(e.key === 'ArrowUp' || e.key === 'ArrowDown'){
+      if(!termHist.length) return;
+      e.preventDefault();
+      termIdx = Math.min(termHist.length, Math.max(0, termIdx + (e.key === 'ArrowUp' ? -1 : 1)));
+      el.value = termHist[termIdx] || '';
+      return;
+    }
     if(e.key !== 'Enter') return;
-    const cmd = e.target.value.trim();
+    let cmd = el.value.trim();
+    if(window.mcCtx) cmd = cmd.replace(/^\/+/, '').trim();
     if(!cmd || !pendingControlDoc) return;
-    e.target.value = '';
+    el.value = '';
+    if(termHist[termHist.length - 1] !== cmd) termHist.push(cmd);
+    termIdx = termHist.length;
     try{
       const idToken = await auth.currentUser.getIdToken();
-      await fetch(`${API_BASE}/server_command`, {
+      const res = await fetch(`${API_BASE}/server_command`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ idToken, docId: pendingControlDoc, command: cmd })
       });
+      const data = await res.json().catch(() => ({}));
+      if(!res.ok || data.ok === false){
+        const st = document.getElementById('serverState');
+        const off = st && st.dataset.state !== 'running';
+        termPrint(`[✖] ${off ? 'Server is not running' : (PWR_ERR[res.status] || data.error || 'Command failed')}`);
+        return;
+      }
       setTimeout(refreshTerminal, 800);
-    }catch(err){}
+    }catch(err){ termPrint('[✖] Could not reach the backend'); }
   });
 
 
@@ -1064,6 +1101,7 @@
       add('Add member', 'add');
       add('Send email', 'email');
       add('Remove Member', 'remove');
+      add('Postpone expiry', 'postpone');
       add('Rename', 'rename');
       add('Delete Server', 'delete', 'danger');
       add('Change theme', 'theme');
@@ -1098,6 +1136,41 @@
     }
   }
 
+  const ppOv = document.getElementById('postponeOverlay'), ppBy = document.getElementById('postponeBy'), ppDate = document.getElementById('postponeDate'), ppSt = document.getElementById('postponeStatus');
+  let ppCtx = null;
+  const iso = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  function baseExpiry(s){
+    const t = s.expiryTimestamp && s.expiryTimestamp.toDate ? s.expiryTimestamp.toDate() : null;
+    const d = t || new Date();
+    return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  }
+  function openPostpone(id, s){
+    ppCtx = { id, s };
+    ppSt.textContent = ''; ppSt.classList.remove('err');
+    ppBy.value = '7'; ppDate.value = '';
+    document.getElementById('postponeCur').textContent = 'Current expiry: ' + (s.expiry || '—');
+    ppOv.classList.add('show');
+  }
+  ppBy.addEventListener('change', () => { ppDate.value = ''; });
+  ppDate.addEventListener('input', () => { if(ppDate.value) ppBy.selectedIndex = -1; });
+  document.getElementById('postponeClose').addEventListener('click', () => ppOv.classList.remove('show'));
+  ppOv.addEventListener('click', e => { if(e.target === ppOv) ppOv.classList.remove('show'); });
+  document.getElementById('postponeSave').addEventListener('click', async () => {
+    if(!ppCtx) return;
+    const base = baseExpiry(ppCtx.s);
+    let next;
+    if(ppDate.value){ const [y,m,d] = ppDate.value.split('-').map(Number); next = new Date(y, m-1, d); }
+    else if(ppBy.value){ next = new Date(base); next.setDate(next.getDate() + parseInt(ppBy.value, 10)); }
+    if(!next || isNaN(next)){ ppSt.textContent = 'Pick a duration or date.'; ppSt.classList.add('err'); return; }
+    if(next <= base){ ppSt.textContent = 'New date must be after the current expiry.'; ppSt.classList.add('err'); return; }
+    ppOv.classList.remove('show');
+    await updateServerDoc(ppCtx.id, {
+      expiry: `${String(next.getDate()).padStart(2,'0')} ${MONTH_NAMES[next.getMonth()]} ${next.getFullYear()}`,
+      expiryTimestamp: firebase.firestore.Timestamp.fromDate(next),
+      reminderSent: false
+    });
+  });
+
   srvMenu.addEventListener('click', async (e) => {
     e.stopPropagation();
     const b = e.target.closest('button');
@@ -1113,6 +1186,7 @@
     else if(act === 'email') openMailModal(s.name || '');
     else if(act === 'add') openServerUsersPanel(id, s).then(() => { if(window.xtShowAddUser) window.xtShowAddUser(true); });
     else if(act === 'remove') openServerUsersPanel(id, s).then(() => { serverUsersOverlay.scrollTop = 0; });
+    else if(act === 'postpone') openPostpone(id, s);
     else if(act === 'rename'){
       const name = prompt('Rename server to:', s.name || '');
       if(name && name.trim() && name.trim() !== s.name) updateServerDoc(id, { name: name.trim() });
